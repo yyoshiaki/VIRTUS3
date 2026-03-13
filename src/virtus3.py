@@ -25,6 +25,7 @@ python virtus3.py \
     --lib_alevin="-l ISF --umiLength 10 --barcodeLength 16 --end 5" \
 """
 
+from html import parser
 import subprocess
 import argparse
 import os
@@ -165,7 +166,12 @@ def pipeline(args):
                     --fastqs={args.fastqs} \
                     --sample={args.sample} \
                     --localcores={args.cores} --localmem={memsize} \
-                    --include-introns true {opt_createbam}"""
+                    --include-introns true {opt_createbam} """
+    
+    # Add to the existing command construction
+    if args.expect_cells:
+        command += f" --expect-cells={args.expect_cells}"
+    
     if (not args.skip_exist) or (not os.path.exists('./cellranger_human/outs/possorted_genome_bam.bam')):
         run_command(command)
     else:
@@ -197,7 +203,20 @@ def pipeline(args):
         raise Exception("ERROR: bamtofastq failed to create unmapped_fqs directory. Check that unmapped.bam is a valid BAM file.")
 
     # 3. make barcode whitelist from cellranger output
-    command = f"zcat raw_feature_bc_matrix/barcodes.tsv.gz | sed 's/-1//g' > raw_feature_bc_matrix/barcodes.tsv"
+    # Check if filtered barcodes exist (highly recommended to avoid Salmon Error 84)
+    # Determine best barcode source
+    filtered_bc_path = 'filtered_feature_bc_matrix/barcodes.tsv.gz'
+    raw_bc_path = 'raw_feature_bc_matrix/barcodes.tsv.gz'
+
+    if os.path.exists(filtered_bc_path) and not args.force_raw_bc:
+        logger.info("Using filtered barcodes for whitelist (prevents Error 84)")
+        source_bc = filtered_bc_path
+    else:
+        logger.warning("Using raw barcodes. Monitor memory to avoid Error 84.")
+        source_bc = raw_bc_path
+
+    command = f"zcat {source_bc} | sed 's/-1//g' > raw_feature_bc_matrix/barcodes.tsv"
+    
     if (not args.skip_exist) or (not os.path.exists('./raw_feature_bc_matrix/barcodes.tsv')):
         run_command(command)
     else:
@@ -224,7 +243,7 @@ def pipeline(args):
     for i, lane in enumerate(lanes):
         logger.info(f"Processing lane: {lane} ({i+1}/{len(lanes)})")
         if len(lanes) == 1:
-            command = f"""{args.salmon} alevin \
+            command = f"""{args.salmon} alevin --no-version-check\
                             {args.lib_alevin} \
                             -1 {' '.join([x for x in list_unmapped_fqs_R1])} \
                             -2 {' '.join([x for x in list_unmapped_fqs_R2])}  \
@@ -345,6 +364,8 @@ def main(args=None):
     parser.add_argument("--cellranger", "-c", type=str, help="cellranger path", required=False, default="cellranger")
     parser.add_argument("--salmon", "-sl", type=str, help="salmon path", required=False, default="salmon")
     parser.add_argument("--samtools", "-sam", type=str, help="samtools path", required=False, default="samtools")
+    parser.add_argument("--expect-cells", type=int, help="Expected number of cells for CellRanger", default=None)
+    parser.add_argument("--force-raw-bc", action="store_true", help="Force use of raw barcodes even if filtered are available")
     parser.add_argument("--cores", "-p", type=int, help="number of cores", required=False, default=40)
     parser.add_argument("--mem_per_core", "-m", type=int, help="Memory per core in GB, or -1 to auto-detect from SLURM/system (default: -1)", required=False, default=-1)
     parser.add_argument("--skip_exist", "-skip", action='store_true', help="skip if output file exists", required=False, default=False)
