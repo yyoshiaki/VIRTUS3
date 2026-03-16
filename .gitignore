@@ -3,3 +3,7 @@
 data/
 slogs/
 test_output/
+outputs/
+hl_data/
+yy_data/
+test*/
