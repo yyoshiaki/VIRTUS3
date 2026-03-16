@@ -153,6 +153,8 @@ python -m virtus3 --version
 
 ## Usage
 
+VIRTUS3 uses raw Cell Ranger barcodes for the Alevin whitelist by default, since viral UMIs can be detected in droplets that do not contain a real cell. Add `--use-filtered-bc` if you want to use filtered barcodes instead –  this will use less memory.
+
 ### Basic Command
 ```bash
 python src/virtus3.py \
