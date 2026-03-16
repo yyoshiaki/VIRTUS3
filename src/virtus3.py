@@ -369,7 +369,7 @@ def main(args=None):
     parser.add_argument("--salmon", "-sl", type=str, help="salmon path", required=False, default="salmon")
     parser.add_argument("--samtools", "-sam", type=str, help="samtools path", required=False, default="samtools")
     parser.add_argument("--expect-cells", type=int, help="Expected number of cells for CellRanger", default=None)
-    parser.add_argument("--use-filtered-bc", action="store_true", help="Use filtered barcodes instead of raw barcodes")
+    parser.add_argument("--use-filtered-bc", action="store_true", help="Use filtered barcodes instead of raw barcodes", default=False)
     parser.add_argument("--cores", "-p", type=int, help="number of cores", required=False, default=40)
     parser.add_argument("--mem_per_core", "-m", type=int, help="Memory per core in GB, or -1 to auto-detect from SLURM/system (default: -1)", required=False, default=-1)
     parser.add_argument("--skip_exist", "-skip", action='store_true', help="skip if output file exists", required=False, default=False)
