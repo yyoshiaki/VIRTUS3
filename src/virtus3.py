@@ -134,6 +134,7 @@ def pipeline(args):
 
     # Filter and log files that will be processed for the specified sample
     df_samples_filtered = df_samples[df_samples['sample_name'] == args.sample]
+    
     if len(df_samples_filtered) > 0:
         logger.info(f"Files that will be processed for sample '{args.sample}':")
         for _, row in df_samples_filtered.iterrows():
@@ -226,13 +227,13 @@ def pipeline(args):
     else:
         logger.info('Skipping barcode whitelist creation (already exists)')
 
-    # 4. Alevin (per lane)
+    # 4. Alevin on all unmapped fastqs
     f_out_h5ad = f"{args.output}/alevin_virus.h5ad"
     f_out_csv = f"{args.output}/alevin_virus.csv"
 
-    lanes = df_samples.loc[df_samples['sample_name']==args.sample, 'lane'].unique()
-    list_unmapped_fqs_R1 = glob.glob('unmapped_fqs/*/*_R1_00*.fastq.gz')
-    list_unmapped_fqs_R2 = glob.glob('unmapped_fqs/*/*_R2_00*.fastq.gz')
+    lanes = df_samples.loc[df_samples['sample_name'] == args.sample, 'lane'].unique()
+    list_unmapped_fqs_R1 = sorted(glob.glob('unmapped_fqs/*/*_R1_00*.fastq.gz'))
+    list_unmapped_fqs_R2 = sorted(glob.glob('unmapped_fqs/*/*_R2_00*.fastq.gz'))
 
     # Validate that fastq files were found
     if not list_unmapped_fqs_R1 or not list_unmapped_fqs_R2:
@@ -241,98 +242,70 @@ def pipeline(args):
                        f"  2. The glob pattern doesn't match the actual file names\n"
                        f"  3. bamtofastq failed to create fastq files\n"
                        f"Files found - R1: {list_unmapped_fqs_R1}\nFiles found - R2: {list_unmapped_fqs_R2}")
+    logger.info(f"Input lanes detected from original fastqs: {list(lanes)}")
+    logger.info(f"Running Alevin on all unmapped fastqs together: {len(list_unmapped_fqs_R1)} R1 files, {len(list_unmapped_fqs_R2)} R2 files")
 
-    list_adata = []
+    alevin_outdir = 'alevin_virus'
+    command = f"""{args.salmon} --no-version-check alevin \
+                    {args.lib_alevin} \
+                    -1 {' '.join(list_unmapped_fqs_R1)} \
+                    -2 {' '.join(list_unmapped_fqs_R2)} \
+                    -i {args.index_virus} \
+                    -p {args.cores} \
+                    -o {alevin_outdir} \
+                    --tgMap {args.tgMap} \
+                    --whitelist {output_bc} \
+                    --dumpMtx
+                """
 
-    for i, lane in enumerate(lanes):
-        logger.info(f"Processing lane: {lane} ({i+1}/{len(lanes)})")
-        if len(lanes) == 1:
-            command = f"""{args.salmon} --no-version-check alevin\
-                            {args.lib_alevin} \
-                            -1 {' '.join([x for x in list_unmapped_fqs_R1])} \
-                            -2 {' '.join([x for x in list_unmapped_fqs_R2])}  \
-                            -i {args.index_virus} \
-                            -p {args.cores} \
-                            -o alevin_virus_lane_{lane} \
-                            --tgMap {args.tgMap} \
-                            --whitelist {output_bc} \
-                            --dumpMtx
-                        """
-        else:
-            r1_files = [x for x in list_unmapped_fqs_R1 if x.split('_')[-3] == 'L'+lane]
-            r2_files = [x for x in list_unmapped_fqs_R2 if x.split('_')[-3] == 'L'+lane]
-            logger.info(f"R1 files for lane {lane}: {r1_files}")
-            logger.info(f"R2 files for lane {lane}: {r2_files}")
-            remaining = lanes[i:]
-            logger.info(f"Processing lane: {lane}")
-            # logger.info(f"Remaining lanes: {list(remaining)}")
-            command = f"""{args.salmon} alevin \
-                            {args.lib_alevin} \
-                            -1 {' '.join([x for x in list_unmapped_fqs_R1 if x.split('_')[-3] == 'L'+lane])} \
-                            -2 {' '.join([x for x in list_unmapped_fqs_R2 if x.split('_')[-3] == 'L'+lane])}  \
-                            -i {args.index_virus} \
-                            -p {args.cores} \
-                            -o alevin_virus_lane_{lane} \
-                            --tgMap {args.tgMap} \
-                            --whitelist {output_bc} \
-                            --dumpMtx
-                        """
+    f_salmon_log = f'{alevin_outdir}/logs/salmon_quant.log'
+    if (not args.skip_exist) or (not os.path.exists(f_salmon_log)):
+        run_command(command)
+    else:
+        logger.info("Skipping alevin (output already exists)")
 
-        if (not args.skip_exist) or (not os.path.exists(f'alevin_virus_lane_{lane}/logs/salmon_quant.log')):
-            run_command(command)
-        else:
-            logger.info(f"Skipping alevin for lane {lane} (output already exists)")
+    if not os.path.exists(f_salmon_log):
+        raise Exception(
+            "ERROR: salmon alevin did not produce the expected log file. "
+            f"Expected: {f_salmon_log}"
+        )
 
-        # parse salmon log
-        f_salmon_log = f'alevin_virus_lane_{lane}/logs/salmon_quant.log'
-        with open(f_salmon_log) as f:
-            salmon_log = f.read()
-        num_reads = re.search(r'Counted ([\d,]+) total reads in the equivalence classes', salmon_log).group(1)
-        num_reads = int(num_reads.replace(",", ""))
-        is_finish = re.search(r'\[jointLog\] \[info\] finished quantifyLibrary\(\)', salmon_log) != None
+    with open(f_salmon_log) as f:
+        salmon_log = f.read()
+    num_reads = re.search(r'Counted ([\d,]+) total reads in the equivalence classes', salmon_log).group(1)
+    num_reads = int(num_reads.replace(",", ""))
+    is_finish = re.search(r'\[jointLog\] \[info\] finished quantifyLibrary\(\)', salmon_log) != None
 
-        if is_finish and (num_reads > 0):
-            logger.info(f"Viral reads detected in lane {lane}, num reads: {num_reads}")
-            # convert alevin output to h5ad
-            f = f"alevin_virus_lane_{lane}/alevin/quants_mat.mtx.gz"
-            f_obs = f"alevin_virus_lane_{lane}/alevin/quants_mat_rows.txt"
-            f_var = f"alevin_virus_lane_{lane}/alevin/quants_mat_cols.txt"
-            adata = sc.AnnData(X=np.array(mmread(f).todense()), obs=pd.read_csv(f_obs, header=None, index_col=0), var=pd.read_csv(f_var, header=None, index_col=0))
-            # adata = sc.AnnData(mmread(f), pd.read_csv(f_obs, header=None, index_col=0), pd.read_csv(f_var, header=None, index_col=0))
-            adata.obs.index.name = None
-            adata.obs.index  = adata.obs.index + '-1'
-            adata.var.index.name = None
+    if is_finish and (num_reads > 0):
+        logger.info(f"Viral reads detected across all unmapped fastqs, num reads: {num_reads}")
+        f = f"{alevin_outdir}/alevin/quants_mat.mtx.gz"
+        f_obs = f"{alevin_outdir}/alevin/quants_mat_rows.txt"
+        f_var = f"{alevin_outdir}/alevin/quants_mat_cols.txt"
+        adata = sc.AnnData(
+            X=np.array(mmread(f).todense()),
+            obs=pd.read_csv(f_obs, header=None, index_col=0),
+            var=pd.read_csv(f_var, header=None, index_col=0)
+        )
+        adata.obs.index.name = None
+        adata.obs.index = adata.obs.index + '-1'
+        adata.var.index.name = None
+    else:
+        logger.info("No viral reads detected across all unmapped fastqs")
+        f_var = f"{alevin_outdir}/alevin/quants_mat_cols.txt"
+        df_var = pd.read_csv(f_var, header=None, index_col=0)
+        adata = sc.AnnData(X=np.empty((0, df_var.shape[0])), var=df_var)
+        adata.var.index.name = None
 
-            list_adata.append(adata)
-
-        else:
-            logger.info(f"No viral reads detected in lane {lane}")
-
-            f_var = f"alevin_virus_lane_{lane}/alevin/quants_mat_cols.txt"
-            df_var = pd.read_csv(f_var, header=None, index_col=0)
-            adata = sc.AnnData(X=np.empty((0,df_var.shape[0])), var=df_var)
-            adata.var.index.name = None
-            list_adata.append(adata)
-
-    adata_concat = sc.concat(list_adata)
-    # logging duplicated barcodes
-    dup_mask = adata_concat.obs_names.duplicated()
-    logger.info(f"Number of duplicated barcodes: {dup_mask.sum()}")
-    # aggregate duplicated barcodes 
-    df = adata_concat.to_df()               
-    df_agg = df.groupby(df.index).sum()     
-    adata_agg = sc.AnnData(df_agg)
-    adata_agg.var_names = df_agg.columns   
-    adata_agg.to_df().to_csv(f_out_csv)
-    adata_agg.write(f_out_h5ad)
-    num_viral_reads = adata_agg.to_df().sum().sum()
+    adata.to_df().to_csv(f_out_csv)
+    adata.write(f_out_h5ad)
+    num_viral_reads = adata.to_df().sum().sum()
     total_umis = int(num_viral_reads)
     logger.info(
-        f"Total viral UMIs across all lanes "
+        f"Total viral UMIs across all unmapped fastqs "
         f"(from Alevin quants_mat, after whitelisting/filtering): {total_umis}"
     )
     log += (
-        f"Total viral UMIs across all lanes "
+        f"Total viral UMIs across all unmapped fastqs "
         f"(from Alevin quants_mat, after whitelisting/filtering): {total_umis}\n"
     )
     return log
