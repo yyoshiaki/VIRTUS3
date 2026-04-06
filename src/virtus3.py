@@ -64,6 +64,17 @@ def run_command(command):
         logger.error(f"stderr: {result.stderr}")
     return result.stdout
 
+
+def run_command_result(command):
+    compact_cmd = " ".join(command.split())
+    logger.info(f"Executing: {compact_cmd}")
+    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(f"Command failed with return code {result.returncode}")
+        logger.error(f"stdout: {result.stdout}")
+        logger.error(f"stderr: {result.stderr}")
+    return result
+
 def analyze_fastq_name(fastqs):
     list_attributes = []
     for filename in fastqs:
@@ -173,13 +184,24 @@ def pipeline(args):
     if args.expect_cells:
         command += f" --expect-cells={args.expect_cells}"
     
+    cellranger_result = None
     if (not args.skip_exist) or (not os.path.exists('./cellranger_human/outs/possorted_genome_bam.bam')):
-        run_command(command)
+        cellranger_result = run_command_result(command)
     else:
         logger.info("Skipping cellranger count (output already exists)")
 
     # 2. extract unmapped reads
-    os.chdir("cellranger_human/outs")
+    cellranger_outs = os.path.join(args.output, "cellranger_human", "outs")
+    if not os.path.isdir(cellranger_outs):
+        if cellranger_result is not None and cellranger_result.returncode != 0:
+            raise RuntimeError(
+                "cellranger count failed and did not create the expected output directory: "
+                f"{cellranger_outs}"
+            )
+        raise FileNotFoundError(
+            f"Expected Cell Ranger output directory does not exist: {cellranger_outs}"
+        )
+    os.chdir(cellranger_outs)
     command = f"samtools view -f 4 -h -b possorted_genome_bam.bam > unmapped.bam"
 
     if (not args.skip_exist) or (not os.path.exists('./unmapped.bam')):
@@ -259,30 +281,49 @@ def pipeline(args):
                 """
 
     f_salmon_log = f'{alevin_outdir}/logs/salmon_quant.log'
+    alevin_result = None
     if (not args.skip_exist) or (not os.path.exists(f_salmon_log)):
-        run_command(command)
+        alevin_result = run_command_result(command)
     else:
         logger.info("Skipping alevin (output already exists)")
 
     if not os.path.exists(f_salmon_log):
+        extra_message = ""
+        if alevin_result is not None and alevin_result.returncode != 0:
+            extra_message = (
+                f" salmon alevin exited with code {alevin_result.returncode}. "
+                "See the logged stdout/stderr above."
+            )
         raise Exception(
             "ERROR: salmon alevin did not produce the expected log file. "
-            f"Expected: {f_salmon_log}"
+            f"Expected: {f_salmon_log}.{extra_message}"
         )
+
+    f_mtx = f"{alevin_outdir}/alevin/quants_mat.mtx.gz"
+    f_obs = f"{alevin_outdir}/alevin/quants_mat_rows.txt"
+    f_var = f"{alevin_outdir}/alevin/quants_mat_cols.txt"
+    f_alevin_log = f"{alevin_outdir}/alevin/alevin.log"
+    required_quants = [f_mtx, f_obs, f_var]
+    missing_quants = [path for path in required_quants if not os.path.exists(path)]
+    has_quants = len(missing_quants) == 0
 
     with open(f_salmon_log) as f:
         salmon_log = f.read()
-    num_reads = re.search(r'Counted ([\d,]+) total reads in the equivalence classes', salmon_log).group(1)
-    num_reads = int(num_reads.replace(",", ""))
+    num_reads_match = re.search(r'Counted ([\d,]+) total reads in the equivalence classes', salmon_log)
+    num_reads = None
+    if num_reads_match is not None:
+        num_reads = int(num_reads_match.group(1).replace(",", ""))
     is_finish = re.search(r'\[jointLog\] \[info\] finished quantifyLibrary\(\)', salmon_log) != None
 
-    if is_finish and (num_reads > 0):
+    if is_finish and num_reads is not None and num_reads > 0:
+        if not has_quants:
+            raise RuntimeError(
+                "salmon alevin reported viral reads but did not produce a complete quant matrix. "
+                f"Missing files: {missing_quants}"
+            )
         logger.info(f"Viral reads detected across all unmapped fastqs, num reads: {num_reads}")
-        f = f"{alevin_outdir}/alevin/quants_mat.mtx.gz"
-        f_obs = f"{alevin_outdir}/alevin/quants_mat_rows.txt"
-        f_var = f"{alevin_outdir}/alevin/quants_mat_cols.txt"
         adata = sc.AnnData(
-            X=np.array(mmread(f).todense()),
+            X=np.array(mmread(f_mtx).todense()),
             obs=pd.read_csv(f_obs, header=None, index_col=0),
             var=pd.read_csv(f_var, header=None, index_col=0)
         )
@@ -290,11 +331,43 @@ def pipeline(args):
         adata.obs.index = adata.obs.index + '-1'
         adata.var.index.name = None
     else:
-        logger.info("No viral reads detected across all unmapped fastqs")
-        f_var = f"{alevin_outdir}/alevin/quants_mat_cols.txt"
-        df_var = pd.read_csv(f_var, header=None, index_col=0)
-        adata = sc.AnnData(X=np.empty((0, df_var.shape[0])), var=df_var)
-        adata.var.index.name = None
+        if is_finish and num_reads == 0:
+            logger.info("No viral reads detected across all unmapped fastqs")
+            logger.warning(
+                "salmon alevin finished with zero mapped reads. "
+                "Returning an empty matrix using tgMap features."
+            )
+            df_var = pd.read_csv(args.tgMap, sep='\t', header=None, usecols=[1]).drop_duplicates().set_index(1)
+            adata = sc.AnnData(X=np.empty((0, df_var.shape[0])), var=df_var)
+            adata.var.index.name = None
+        elif has_quants:
+            logger.warning(
+                "salmon_quant.log did not provide a clean completion signal, but a complete quant matrix exists. "
+                "Proceeding from matrix outputs."
+            )
+            adata = sc.AnnData(
+                X=np.array(mmread(f_mtx).todense()),
+                obs=pd.read_csv(f_obs, header=None, index_col=0),
+                var=pd.read_csv(f_var, header=None, index_col=0)
+            )
+            adata.obs.index.name = None
+            adata.obs.index = adata.obs.index + '-1'
+            adata.var.index.name = None
+            num_reads = int(np.asarray(adata.X).sum() > 0)
+        else:
+            alevin_tail = ''
+            if os.path.exists(f_alevin_log):
+                with open(f_alevin_log) as f:
+                    alevin_tail = '\n'.join(f.read().splitlines()[-5:])
+            df_var = pd.read_csv(args.tgMap, sep='\t', header=None, usecols=[1]).drop_duplicates().set_index(1)
+            adata = sc.AnnData(X=np.empty((0, df_var.shape[0])), var=df_var)
+            adata.var.index.name = None
+            raise RuntimeError(
+                "salmon alevin produced incomplete output. "
+                f"Missing files: {missing_quants}. "
+                f"Could not infer a clean zero-read completion from {f_salmon_log}. "
+                f"Tail of alevin.log:\n{alevin_tail}"
+            )
 
     adata.to_df().to_csv(f_out_csv)
     adata.write(f_out_h5ad)

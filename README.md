@@ -43,6 +43,12 @@ EBER2	EBER2
 
 Users can also make their own custom references.
 
+## Robustness Notes
+
+Updated: 2026-04-06 EDT
+
+Recent robustness updates in VIRTUS3 0.0.3 improve failure handling around Cell Ranger and Salmon/Alevin outputs. If `cellranger_human/outs` is missing after `cellranger count`, VIRTUS3 now stops immediately with a clear error instead of failing later in downstream steps. For Salmon/Alevin outputs, VIRTUS3 now distinguishes among complete outputs with viral reads, zero-read completions, and incomplete outputs. When `finished quantifyLibrary()` is present with zero reads, VIRTUS3 returns an empty matrix using features from `tgMap`. When output files are incomplete in other situations, VIRTUS3 raises a diagnostic error and includes the tail of `alevin.log` to make debugging easier.
+
 ## Installation & Setup
 
 ### Required Tools
