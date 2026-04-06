@@ -7,6 +7,7 @@ import sys
 
 import pandas as pd
 import pytest
+import scanpy as sc
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +51,15 @@ def make_dummy_fastqs(fastqs_dir, sample):
 def copy_file(source, target):
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, target)
+
+
+def assert_h5ad_equal(result_path, expected_path):
+    result = sc.read_h5ad(result_path)
+    expected = sc.read_h5ad(expected_path)
+    assert list(result.obs_names) == list(expected.obs_names)
+    assert list(result.var_names) == list(expected.var_names)
+    assert result.shape == expected.shape
+    assert (result.X != expected.X).nnz == 0 if hasattr(result.X, "nnz") else (result.X == expected.X).all()
 
 
 def prepare_minimal_outs(sample, output_dir, include_stale_lane=False):
@@ -130,6 +140,9 @@ def test_pipeline_complete_with_reads(tmp_path, stub_run_command):
     df = pd.read_csv(csv_path, index_col=0)
     assert df.shape[0] > 0
     assert df.to_numpy().sum() > 0
+    expected_csv = pd.read_csv(SCRATCH_ROOT / sample / "alevin_virus.csv", index_col=0)
+    pd.testing.assert_frame_equal(df, expected_csv)
+    assert_h5ad_equal(output_dir / "alevin_virus.h5ad", SCRATCH_ROOT / sample / "alevin_virus.h5ad")
     assert "Total viral UMIs" in log
 
 
@@ -146,8 +159,11 @@ def test_pipeline_zero_read_partial_output_returns_empty_matrix(tmp_path, stub_r
     csv_path = output_dir / "alevin_virus.csv"
     assert csv_path.exists()
     df = pd.read_csv(csv_path, index_col=0)
-    expected_features = pd.read_csv(TG_MAP, sep="\t", header=None, usecols=[1]).drop_duplicates().shape[0]
+    expected_features = virtus3.load_tgmap_features(TG_MAP).shape[0]
     assert df.shape == (0, expected_features)
+    expected_csv = pd.read_csv(SCRATCH_ROOT / sample / "alevin_virus.csv", index_col=0)
+    pd.testing.assert_frame_equal(df, expected_csv)
+    assert_h5ad_equal(output_dir / "alevin_virus.h5ad", SCRATCH_ROOT / sample / "alevin_virus.h5ad")
     assert "Total viral UMIs" in log
 
 

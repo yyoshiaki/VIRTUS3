@@ -132,6 +132,11 @@ def get_memory_gb(mem_arg, cores, safety_margin=0.95):
     return int(allocated * safety_margin)
 
 
+def load_tgmap_features(tgmap_path):
+    df_var = pd.read_csv(tgmap_path, sep=r"\s+", header=None, usecols=[1], engine="python")
+    return df_var.dropna().drop_duplicates().set_index(1)
+
+
 def pipeline(args):
     log = ""
 
@@ -337,7 +342,7 @@ def pipeline(args):
                 "salmon alevin finished with zero mapped reads. "
                 "Returning an empty matrix using tgMap features."
             )
-            df_var = pd.read_csv(args.tgMap, sep='\t', header=None, usecols=[1]).drop_duplicates().set_index(1)
+            df_var = load_tgmap_features(args.tgMap)
             adata = sc.AnnData(X=np.empty((0, df_var.shape[0])), var=df_var)
             adata.var.index.name = None
         elif has_quants:
@@ -359,7 +364,7 @@ def pipeline(args):
             if os.path.exists(f_alevin_log):
                 with open(f_alevin_log) as f:
                     alevin_tail = '\n'.join(f.read().splitlines()[-5:])
-            df_var = pd.read_csv(args.tgMap, sep='\t', header=None, usecols=[1]).drop_duplicates().set_index(1)
+            df_var = load_tgmap_features(args.tgMap)
             adata = sc.AnnData(X=np.empty((0, df_var.shape[0])), var=df_var)
             adata.var.index.name = None
             raise RuntimeError(
