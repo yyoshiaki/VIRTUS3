@@ -25,6 +25,7 @@ python virtus3.py \
     --lib_alevin="-l ISF --umiLength 10 --barcodeLength 16 --end 5" \
 """
 
+from html import parser
 import subprocess
 import argparse
 import os
@@ -62,6 +63,17 @@ def run_command(command):
         logger.error(f"stdout: {result.stdout}")
         logger.error(f"stderr: {result.stderr}")
     return result.stdout
+
+
+def run_command_result(command):
+    compact_cmd = " ".join(command.split())
+    logger.info(f"Executing: {compact_cmd}")
+    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(f"Command failed with return code {result.returncode}")
+        logger.error(f"stdout: {result.stdout}")
+        logger.error(f"stderr: {result.stderr}")
+    return result
 
 def analyze_fastq_name(fastqs):
     list_attributes = []
@@ -120,6 +132,11 @@ def get_memory_gb(mem_arg, cores, safety_margin=0.95):
     return int(allocated * safety_margin)
 
 
+def load_tgmap_features(tgmap_path):
+    df_var = pd.read_csv(tgmap_path, sep=r"\s+", header=None, usecols=[1], engine="python")
+    return df_var.dropna().drop_duplicates().set_index(1)
+
+
 def pipeline(args):
     log = ""
 
@@ -133,6 +150,7 @@ def pipeline(args):
 
     # Filter and log files that will be processed for the specified sample
     df_samples_filtered = df_samples[df_samples['sample_name'] == args.sample]
+    
     if len(df_samples_filtered) > 0:
         logger.info(f"Files that will be processed for sample '{args.sample}':")
         for _, row in df_samples_filtered.iterrows():
@@ -166,13 +184,29 @@ def pipeline(args):
                     --sample={args.sample} \
                     --localcores={args.cores} --localmem={memsize} \
                     --include-introns true {opt_createbam}"""
+    
+    # Add to the existing command construction
+    if args.expect_cells:
+        command += f" --expect-cells={args.expect_cells}"
+    
+    cellranger_result = None
     if (not args.skip_exist) or (not os.path.exists('./cellranger_human/outs/possorted_genome_bam.bam')):
-        run_command(command)
+        cellranger_result = run_command_result(command)
     else:
         logger.info("Skipping cellranger count (output already exists)")
 
     # 2. extract unmapped reads
-    os.chdir("cellranger_human/outs")
+    cellranger_outs = os.path.join(args.output, "cellranger_human", "outs")
+    if not os.path.isdir(cellranger_outs):
+        if cellranger_result is not None and cellranger_result.returncode != 0:
+            raise RuntimeError(
+                "cellranger count failed and did not create the expected output directory: "
+                f"{cellranger_outs}"
+            )
+        raise FileNotFoundError(
+            f"Expected Cell Ranger output directory does not exist: {cellranger_outs}"
+        )
+    os.chdir(cellranger_outs)
     command = f"samtools view -f 4 -h -b possorted_genome_bam.bam > unmapped.bam"
 
     if (not args.skip_exist) or (not os.path.exists('./unmapped.bam')):
@@ -197,19 +231,36 @@ def pipeline(args):
         raise Exception("ERROR: bamtofastq failed to create unmapped_fqs directory. Check that unmapped.bam is a valid BAM file.")
 
     # 3. make barcode whitelist from cellranger output
-    command = f"zcat raw_feature_bc_matrix/barcodes.tsv.gz | sed 's/-1//g' > raw_feature_bc_matrix/barcodes.tsv"
-    if (not args.skip_exist) or (not os.path.exists('./raw_feature_bc_matrix/barcodes.tsv')):
+    # Determine barcode source for the alevin whitelist.
+    filtered_bc_path = 'filtered_feature_bc_matrix/barcodes.tsv.gz'
+    raw_bc_path = 'raw_feature_bc_matrix/barcodes.tsv.gz'
+
+    if args.use_filtered_bc and os.path.exists(filtered_bc_path):
+        logger.info("Using filtered barcodes...")
+        source_bc = filtered_bc_path
+        output_bc = 'filtered_feature_bc_matrix/barcodes.tsv'
+    else:
+        if args.use_filtered_bc:
+            logger.warning("Filtered barcodes requested but not found; using raw barcodes instead...")
+        else:
+            logger.info("Using raw barcodes...")
+        source_bc = raw_bc_path
+        output_bc = 'raw_feature_bc_matrix/barcodes.tsv'
+
+    command = f"zcat {source_bc} | sed 's/-1//g' > {output_bc}"
+    
+    if (not args.skip_exist) or (not os.path.exists(f'./{output_bc}')):
         run_command(command)
     else:
         logger.info('Skipping barcode whitelist creation (already exists)')
 
-    # 4. Alevin (per lane)
+    # 4. Alevin on all unmapped fastqs
     f_out_h5ad = f"{args.output}/alevin_virus.h5ad"
     f_out_csv = f"{args.output}/alevin_virus.csv"
 
-    lanes = df_samples.loc[df_samples['sample_name']==args.sample, 'lane'].unique()
-    list_unmapped_fqs_R1 = glob.glob('unmapped_fqs/*/*_R1_00*.fastq.gz')
-    list_unmapped_fqs_R2 = glob.glob('unmapped_fqs/*/*_R2_00*.fastq.gz')
+    lanes = df_samples.loc[df_samples['sample_name'] == args.sample, 'lane'].unique()
+    list_unmapped_fqs_R1 = sorted(glob.glob('unmapped_fqs/*/*_R1_00*.fastq.gz'))
+    list_unmapped_fqs_R2 = sorted(glob.glob('unmapped_fqs/*/*_R2_00*.fastq.gz'))
 
     # Validate that fastq files were found
     if not list_unmapped_fqs_R1 or not list_unmapped_fqs_R2:
@@ -218,98 +269,121 @@ def pipeline(args):
                        f"  2. The glob pattern doesn't match the actual file names\n"
                        f"  3. bamtofastq failed to create fastq files\n"
                        f"Files found - R1: {list_unmapped_fqs_R1}\nFiles found - R2: {list_unmapped_fqs_R2}")
+    logger.info(f"Input lanes detected from original fastqs: {list(lanes)}")
+    logger.info(f"Running Alevin on all unmapped fastqs together: {len(list_unmapped_fqs_R1)} R1 files, {len(list_unmapped_fqs_R2)} R2 files")
 
-    list_adata = []
+    alevin_outdir = 'alevin_virus'
+    command = f"""{args.salmon} --no-version-check alevin \
+                    {args.lib_alevin} \
+                    -1 {' '.join(list_unmapped_fqs_R1)} \
+                    -2 {' '.join(list_unmapped_fqs_R2)} \
+                    -i {args.index_virus} \
+                    -p {args.cores} \
+                    -o {alevin_outdir} \
+                    --tgMap {args.tgMap} \
+                    --whitelist {output_bc} \
+                    --dumpMtx
+                """
 
-    for i, lane in enumerate(lanes):
-        logger.info(f"Processing lane: {lane} ({i+1}/{len(lanes)})")
-        if len(lanes) == 1:
-            command = f"""{args.salmon} alevin \
-                            {args.lib_alevin} \
-                            -1 {' '.join([x for x in list_unmapped_fqs_R1])} \
-                            -2 {' '.join([x for x in list_unmapped_fqs_R2])}  \
-                            -i {args.index_virus} \
-                            -p {args.cores} \
-                            -o alevin_virus_lane_{lane} \
-                            --tgMap {args.tgMap} \
-                            --whitelist raw_feature_bc_matrix/barcodes.tsv \
-                            --dumpMtx
-                        """
-        else:
-            r1_files = [x for x in list_unmapped_fqs_R1 if x.split('_')[-3] == 'L'+lane]
-            r2_files = [x for x in list_unmapped_fqs_R2 if x.split('_')[-3] == 'L'+lane]
-            logger.info(f"R1 files for lane {lane}: {r1_files}")
-            logger.info(f"R2 files for lane {lane}: {r2_files}")
-            remaining = lanes[i:]
-            logger.info(f"Processing lane: {lane}")
-            # logger.info(f"Remaining lanes: {list(remaining)}")
-            command = f"""{args.salmon} alevin \
-                            {args.lib_alevin} \
-                            -1 {' '.join([x for x in list_unmapped_fqs_R1 if x.split('_')[-3] == 'L'+lane])} \
-                            -2 {' '.join([x for x in list_unmapped_fqs_R2 if x.split('_')[-3] == 'L'+lane])}  \
-                            -i {args.index_virus} \
-                            -p {args.cores} \
-                            -o alevin_virus_lane_{lane} \
-                            --tgMap {args.tgMap} \
-                            --whitelist raw_feature_bc_matrix/barcodes.tsv \
-                            --dumpMtx
-                        """
+    f_salmon_log = f'{alevin_outdir}/logs/salmon_quant.log'
+    alevin_result = None
+    if (not args.skip_exist) or (not os.path.exists(f_salmon_log)):
+        alevin_result = run_command_result(command)
+    else:
+        logger.info("Skipping alevin (output already exists)")
 
-        if (not args.skip_exist) or (not os.path.exists(f'alevin_virus_lane_{lane}/logs/salmon_quant.log')):
-            run_command(command)
-        else:
-            logger.info(f"Skipping alevin for lane {lane} (output already exists)")
+    if not os.path.exists(f_salmon_log):
+        extra_message = ""
+        if alevin_result is not None and alevin_result.returncode != 0:
+            extra_message = (
+                f" salmon alevin exited with code {alevin_result.returncode}. "
+                "See the logged stdout/stderr above."
+            )
+        raise Exception(
+            "ERROR: salmon alevin did not produce the expected log file. "
+            f"Expected: {f_salmon_log}.{extra_message}"
+        )
 
-        # parse salmon log
-        f_salmon_log = f'alevin_virus_lane_{lane}/logs/salmon_quant.log'
-        with open(f_salmon_log) as f:
-            salmon_log = f.read()
-        num_reads = re.search(r'Counted ([\d,]+) total reads in the equivalence classes', salmon_log).group(1)
-        num_reads = int(num_reads.replace(",", ""))
-        is_finish = re.search(r'\[jointLog\] \[info\] finished quantifyLibrary\(\)', salmon_log) != None
+    f_mtx = f"{alevin_outdir}/alevin/quants_mat.mtx.gz"
+    f_obs = f"{alevin_outdir}/alevin/quants_mat_rows.txt"
+    f_var = f"{alevin_outdir}/alevin/quants_mat_cols.txt"
+    f_alevin_log = f"{alevin_outdir}/alevin/alevin.log"
+    required_quants = [f_mtx, f_obs, f_var]
+    missing_quants = [path for path in required_quants if not os.path.exists(path)]
+    has_quants = len(missing_quants) == 0
 
-        if is_finish and (num_reads > 0):
-            logger.info(f"Viral reads detected in lane {lane}, num reads: {num_reads}")
-            # convert alevin output to h5ad
-            f = f"alevin_virus_lane_{lane}/alevin/quants_mat.mtx.gz"
-            f_obs = f"alevin_virus_lane_{lane}/alevin/quants_mat_rows.txt"
-            f_var = f"alevin_virus_lane_{lane}/alevin/quants_mat_cols.txt"
-            adata = sc.AnnData(X=np.array(mmread(f).todense()), obs=pd.read_csv(f_obs, header=None, index_col=0), var=pd.read_csv(f_var, header=None, index_col=0))
-            # adata = sc.AnnData(mmread(f), pd.read_csv(f_obs, header=None, index_col=0), pd.read_csv(f_var, header=None, index_col=0))
+    with open(f_salmon_log) as f:
+        salmon_log = f.read()
+    num_reads_match = re.search(r'Counted ([\d,]+) total reads in the equivalence classes', salmon_log)
+    num_reads = None
+    if num_reads_match is not None:
+        num_reads = int(num_reads_match.group(1).replace(",", ""))
+    is_finish = re.search(r'\[jointLog\] \[info\] finished quantifyLibrary\(\)', salmon_log) != None
+
+    if is_finish and num_reads is not None and num_reads > 0:
+        if not has_quants:
+            raise RuntimeError(
+                "salmon alevin reported viral reads but did not produce a complete quant matrix. "
+                f"Missing files: {missing_quants}"
+            )
+        logger.info(f"Viral reads detected across all unmapped fastqs, num reads: {num_reads}")
+        adata = sc.AnnData(
+            X=np.array(mmread(f_mtx).todense()),
+            obs=pd.read_csv(f_obs, header=None, index_col=0),
+            var=pd.read_csv(f_var, header=None, index_col=0)
+        )
+        adata.obs.index.name = None
+        adata.obs.index = adata.obs.index + '-1'
+        adata.var.index.name = None
+    else:
+        if is_finish and num_reads == 0:
+            logger.info("No viral reads detected across all unmapped fastqs")
+            logger.warning(
+                "salmon alevin finished with zero mapped reads. "
+                "Returning an empty matrix using tgMap features."
+            )
+            df_var = load_tgmap_features(args.tgMap)
+            adata = sc.AnnData(X=np.empty((0, df_var.shape[0])), var=df_var)
+            adata.var.index.name = None
+        elif has_quants:
+            logger.warning(
+                "salmon_quant.log did not provide a clean completion signal, but a complete quant matrix exists. "
+                "Proceeding from matrix outputs."
+            )
+            adata = sc.AnnData(
+                X=np.array(mmread(f_mtx).todense()),
+                obs=pd.read_csv(f_obs, header=None, index_col=0),
+                var=pd.read_csv(f_var, header=None, index_col=0)
+            )
             adata.obs.index.name = None
-            adata.obs.index  = adata.obs.index + '-1'
+            adata.obs.index = adata.obs.index + '-1'
             adata.var.index.name = None
-
-            list_adata.append(adata)
-
+            num_reads = int(np.asarray(adata.X).sum() > 0)
         else:
-            logger.info(f"No viral reads detected in lane {lane}")
-
-            f_var = f"alevin_virus_lane_{lane}/alevin/quants_mat_cols.txt"
-            df_var = pd.read_csv(f_var, header=None, index_col=0)
-            adata = sc.AnnData(X=np.empty((0,df_var.shape[0])), var=df_var)
+            alevin_tail = ''
+            if os.path.exists(f_alevin_log):
+                with open(f_alevin_log) as f:
+                    alevin_tail = '\n'.join(f.read().splitlines()[-5:])
+            df_var = load_tgmap_features(args.tgMap)
+            adata = sc.AnnData(X=np.empty((0, df_var.shape[0])), var=df_var)
             adata.var.index.name = None
-            list_adata.append(adata)
+            raise RuntimeError(
+                "salmon alevin produced incomplete output. "
+                f"Missing files: {missing_quants}. "
+                f"Could not infer a clean zero-read completion from {f_salmon_log}. "
+                f"Tail of alevin.log:\n{alevin_tail}"
+            )
 
-    adata_concat = sc.concat(list_adata)
-    # logging duplicated barcodes
-    dup_mask = adata_concat.obs_names.duplicated()
-    logger.info(f"Number of duplicated barcodes: {dup_mask.sum()}")
-    # aggregate duplicated barcodes 
-    df = adata_concat.to_df()               
-    df_agg = df.groupby(df.index).sum()     
-    adata_agg = sc.AnnData(df_agg)
-    adata_agg.var_names = df_agg.columns   
-    adata_agg.to_df().to_csv(f_out_csv)
-    adata_agg.write(f_out_h5ad)
-    num_viral_reads = adata_agg.to_df().sum().sum()
+    adata.to_df().to_csv(f_out_csv)
+    adata.write(f_out_h5ad)
+    num_viral_reads = adata.to_df().sum().sum()
     total_umis = int(num_viral_reads)
     logger.info(
-        f"Total viral UMIs across all lanes "
+        f"Total viral UMIs across all unmapped fastqs "
         f"(from Alevin quants_mat, after whitelisting/filtering): {total_umis}"
     )
     log += (
-        f"Total viral UMIs across all lanes "
+        f"Total viral UMIs across all unmapped fastqs "
         f"(from Alevin quants_mat, after whitelisting/filtering): {total_umis}\n"
     )
     return log
@@ -345,6 +419,8 @@ def main(args=None):
     parser.add_argument("--cellranger", "-c", type=str, help="cellranger path", required=False, default="cellranger")
     parser.add_argument("--salmon", "-sl", type=str, help="salmon path", required=False, default="salmon")
     parser.add_argument("--samtools", "-sam", type=str, help="samtools path", required=False, default="samtools")
+    parser.add_argument("--expect-cells", type=int, help="Expected number of cells for CellRanger", default=None)
+    parser.add_argument("--use-filtered-bc", action="store_true", help="Use filtered barcodes instead of raw barcodes", default=False)
     parser.add_argument("--cores", "-p", type=int, help="number of cores", required=False, default=40)
     parser.add_argument("--mem_per_core", "-m", type=int, help="Memory per core in GB, or -1 to auto-detect from SLURM/system (default: -1)", required=False, default=-1)
     parser.add_argument("--skip_exist", "-skip", action='store_true', help="skip if output file exists", required=False, default=False)
